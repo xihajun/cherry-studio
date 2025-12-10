@@ -4,16 +4,19 @@ import { useTheme } from '@renderer/context/ThemeProvider'
 import { useAssistant } from '@renderer/hooks/useAssistant'
 import { useSettings } from '@renderer/hooks/useSettings'
 import i18n from '@renderer/i18n'
+import AttachmentPreview from '@renderer/pages/home/Inputbar/AttachmentPreview'
 import { fetchChatCompletion } from '@renderer/services/ApiService'
 import { getDefaultTopic } from '@renderer/services/AssistantService'
 import { ConversationService } from '@renderer/services/ConversationService'
+import FileManager from '@renderer/services/FileManager'
 import { getAssistantMessage, getUserMessage } from '@renderer/services/MessagesService'
+import PasteService from '@renderer/services/PasteService'
 import store, { useAppSelector } from '@renderer/store'
 import { updateOneBlock, upsertManyBlocks, upsertOneBlock } from '@renderer/store/messageBlock'
 import { newMessagesActions, selectMessagesForTopic } from '@renderer/store/newMessage'
 import { cancelThrottledBlockUpdate, throttledBlockUpdate } from '@renderer/store/thunk/messageThunk'
-import type { Topic } from '@renderer/types'
-import { ThemeMode } from '@renderer/types'
+import type { FileMetadata, Topic } from '@renderer/types'
+import { FileTypes, ThemeMode } from '@renderer/types'
 import type { Chunk } from '@renderer/types/chunk'
 import { ChunkType } from '@renderer/types/chunk'
 import { AssistantMessageStatus, MessageBlockStatus } from '@renderer/types/newMessage'
@@ -42,6 +45,8 @@ import InputBar from './components/InputBar'
 
 const logger = loggerService.withContext('HomeWindow')
 
+const SUPPORTED_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']
+
 const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
   const { language, readClipboardAtStartup, windowStyle } = useSettings()
   const { theme } = useTheme()
@@ -63,6 +68,8 @@ const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
   const [isOutputted, setIsOutputted] = useState(false)
 
   const [error, setError] = useState<string | null>(null)
+
+  const [files, setFiles] = useState<FileMetadata[]>([])
 
   const { quickAssistantId } = useAppSelector((state) => state.llm)
   const { assistant: currentAssistant } = useAssistant(quickAssistantId)
@@ -166,7 +173,7 @@ const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
           if (isLoading) return
 
           e.preventDefault()
-          if (userContent) {
+          if (userContent || files.length) {
             if (route === 'home') {
               featureMenusRef.current?.useFeature()
             } else {
@@ -218,19 +225,73 @@ const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
     setError(error.message)
   }
 
+  const mergeImageFiles = useCallback((updater: (prevFiles: FileMetadata[]) => FileMetadata[]) => {
+    setFiles((prevFiles) => {
+      const updated = updater(prevFiles)
+      const seen = new Set<string>()
+
+      return updated.filter((file) => {
+        if (file.type !== FileTypes.IMAGE) return false
+        if (seen.has(file.id)) return false
+        seen.add(file.id)
+        return true
+      })
+    })
+  }, [])
+
+  const handleSelectImages = useCallback(async () => {
+    try {
+      const selectedFiles = await FileManager.selectFiles({
+        properties: ['openFile', 'multiSelections'],
+        filters: [
+          {
+            name: t('chat.input.upload.attachment'),
+            extensions: SUPPORTED_IMAGE_EXTS.map((ext) => ext.replace('.', ''))
+          }
+        ]
+      })
+
+      if (selectedFiles?.length) {
+        mergeImageFiles((prev) => [...prev, ...selectedFiles])
+      }
+    } catch (error) {
+      logger.warn('Failed to select images:', error as Error)
+    }
+  }, [mergeImageFiles, t])
+
+  const handlePaste = useCallback(
+    async (event: React.ClipboardEvent<HTMLInputElement>) => {
+      await PasteService.handlePaste(
+        event.nativeEvent,
+        SUPPORTED_IMAGE_EXTS,
+        mergeImageFiles,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        t
+      )
+    },
+    [mergeImageFiles, t]
+  )
+
   const handleSendMessage = useCallback(
     async (prompt?: string) => {
-      if (isEmpty(userContent) || !currentTopic.current) {
+      if ((isEmpty(userContent) && files.length === 0) || !currentTopic.current) {
         return
       }
 
       try {
         const topicId = currentTopic.current.id
 
+        const uploadedFiles = files.length ? await FileManager.uploadFiles(files) : []
+
         const { message: userMessage, blocks } = getUserMessage({
-          content: [prompt, userContent].filter(Boolean).join('\n\n'),
+          content: [prompt, userContent].filter(Boolean).join('\n\n') || undefined,
           assistant: currentAssistant,
-          topic: currentTopic.current
+          topic: currentTopic.current,
+          files: uploadedFiles
         })
 
         store.dispatch(newMessagesActions.addMessage({ topicId, message: userMessage }))
@@ -272,6 +333,7 @@ const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
 
         setIsFirstMessage(false)
         setUserInputText('')
+        setFiles([])
 
         const newAssistant = cloneDeep(currentAssistant)
         if (!newAssistant.settings) {
@@ -452,7 +514,7 @@ const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
         currentAskId.current = ''
       }
     },
-    [userContent, currentAssistant]
+    [userContent, currentAssistant, files]
   )
 
   const handlePause = useCallback(() => {
@@ -482,6 +544,7 @@ const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
         setError(null)
         setRoute('home')
         setUserInputText('')
+        setFiles([])
       }
     }
   }, [isLoading, route, handleCloseWindow, currentAssistant.id, handlePause])
@@ -544,10 +607,19 @@ const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
                 referenceText={referenceText}
                 placeholder={inputPlaceholder}
                 loading={isLoading}
+                files={files}
+                onSelectImages={handleSelectImages}
                 handleKeyDown={handleKeyDown}
+                handlePaste={handlePaste}
                 handleChange={handleChange}
                 ref={inputBarRef}
               />
+              {files.length > 0 && (
+                <>
+                  <AttachmentPreview files={files} setFiles={setFiles} />
+                  <Divider style={{ margin: '8px 0' }} />
+                </>
+              )}
               <Divider style={{ margin: '10px 0' }} />
             </>
           )}
@@ -588,10 +660,19 @@ const HomeWindow: FC<{ draggable?: boolean }> = ({ draggable = true }) => {
             referenceText={referenceText}
             placeholder={inputPlaceholder}
             loading={isLoading}
+            files={files}
+            onSelectImages={handleSelectImages}
             handleKeyDown={handleKeyDown}
+            handlePaste={handlePaste}
             handleChange={handleChange}
             ref={inputBarRef}
           />
+          {files.length > 0 && (
+            <>
+              <AttachmentPreview files={files} setFiles={setFiles} />
+              <Divider style={{ margin: '8px 0' }} />
+            </>
+          )}
           <Divider style={{ margin: '10px 0' }} />
           <ClipboardPreview referenceText={referenceText} clearClipboard={clearClipboard} t={t} />
           <Main>
